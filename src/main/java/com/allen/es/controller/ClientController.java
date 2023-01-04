@@ -1,28 +1,36 @@
 package com.allen.es.controller;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.StoredScript;
+import co.elastic.clients.elasticsearch._types.Time;
 import co.elastic.clients.elasticsearch._types.mapping.LongNumberProperty;
 import co.elastic.clients.elasticsearch._types.mapping.Property;
 import co.elastic.clients.elasticsearch._types.mapping.TextProperty;
 import co.elastic.clients.elasticsearch._types.mapping.TypeMapping;
+import co.elastic.clients.elasticsearch._types.query_dsl.FuzzyQuery;
 import co.elastic.clients.elasticsearch._types.query_dsl.MatchQuery;
 import co.elastic.clients.elasticsearch._types.query_dsl.Query;
-import co.elastic.clients.elasticsearch.core.SearchRequest;
-import co.elastic.clients.elasticsearch.core.SearchResponse;
+import co.elastic.clients.elasticsearch.core.*;
+import co.elastic.clients.elasticsearch.core.bulk.*;
+import co.elastic.clients.elasticsearch.core.search.Hit;
 import co.elastic.clients.elasticsearch.indices.CreateIndexRequest;
 import co.elastic.clients.elasticsearch.indices.CreateIndexResponse;
 import co.elastic.clients.elasticsearch.indices.IndexSettings;
+import co.elastic.clients.json.JsonData;
 import com.allen.es.dto.ResultDto;
 import com.allen.es.entity.CarSerialBrand;
 import com.allen.es.util.ESClient;
 import lombok.SneakyThrows;
+import org.elasticsearch.client.Request;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.io.InputStream;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/car")
@@ -102,6 +110,14 @@ public class ClientController {
         return createIndexResponse.index();
     }
 
+    /**
+     * 分页查询
+     *
+     * @param keyword
+     * @param from
+     * @param size
+     * @return
+     */
     @RequestMapping("/carInfo")
     @SneakyThrows
     public ResultDto carInfo(@RequestParam(value = "keyword", required = true) String keyword,
@@ -119,7 +135,122 @@ public class ClientController {
                 .size(size)
         ), CarSerialBrand.class);
         ResultDto<Object> resultDto = new ResultDto<>();
-        resultDto.setData(response.hits().hits());
+        List<CarSerialBrand> carSerialBrands = response.hits().hits().stream().map(Hit::source).collect(Collectors.toList());
+        resultDto.setData(carSerialBrands);
         return resultDto;
+    }
+
+    //region 滚动查询
+    @RequestMapping("/scroll")
+    @SneakyThrows
+    public ResultDto scroll(String scrollId) {
+        SearchRequest searchRequest = SearchRequest.of(s -> s
+                .index("car")
+                .scroll(Time.of(t -> t.time("1m")))
+                .size(2));
+        SearchResponse<CarSerialBrand> response = scrollId == null
+                ? client.search(searchRequest, CarSerialBrand.class)
+                : client.scroll(ScrollRequest.of(s -> s.scrollId(scrollId)), CarSerialBrand.class);
+        List<CarSerialBrand> list = response.hits().hits().stream().map(Hit::source).collect(Collectors.toList());
+        ResultDto res = new ResultDto();
+        res.setTag(response.scrollId());
+        res.setData(list);
+        return res;
+    }
+
+    //region fuzzy
+    @RequestMapping("/fuzzy")
+    @SneakyThrows
+    public List<CarSerialBrand> fuzzy(String name) {
+        SearchResponse<CarSerialBrand> response = client.search(SearchRequest.of(s -> s
+                .index("car")
+                .query(Query.of(q -> q
+                        .fuzzy(FuzzyQuery.of(f -> f
+                                .field("brand_name.keyword")
+                                .value(name)
+                                .fuzziness("auto")
+                        ))
+                ))
+        ), CarSerialBrand.class);
+        List<CarSerialBrand> list = response.hits().hits().stream().map(Hit::source).collect(Collectors.toList());
+
+        return list;
+    }
+
+
+    //region Bulk
+    @RequestMapping("/bulk")
+    @SneakyThrows
+    public ResultDto bulk() {
+        BulkResponse bulkResponse = client.bulk(b -> b
+                .index("car")
+                .operations(BulkOperation.of(o -> o
+                        .delete(DeleteOperation.of(d -> d
+                                .id("300")
+                        ))
+                ))
+                .operations(BulkOperation.of(o -> o
+                        .update(UpdateOperation.of(u -> u
+                                .id("301")
+                                .action(UpdateAction.of(a -> a
+                                        .doc(new CarSerialBrand())
+                                ))
+                        ))
+                ))
+                .operations(BulkOperation.of(o -> o
+                        .index(IndexOperation.of(i -> i
+                                .index("car")
+                                .id("33333")
+                                .document(new CarSerialBrand())
+                        ))
+                ))
+        );
+        return null;
+    }
+
+    //region Search template
+    @RequestMapping("/templateSearch")
+    @SneakyThrows
+    public ResultDto templateSearch() {
+        Request scriptRequest = new Request("POST", "_scripts/test_template_search");
+        scriptRequest.setJsonEntity(
+                "{" +
+                        "  \"script\": {" +
+                        "    \"lang\": \"mustache\"," +
+                        "    \"source\": {" +
+                        "      \"query\": { \"match\" : { \"{{field}}\" : \"{{value}}\" } }," +
+                        "      \"size\" : \"{{size}}\"" +
+                        "    }" +
+                        "  }" +
+                        "}");
+        PutScriptRequest putScriptRequest = new PutScriptRequest.Builder()
+                .id("_scripts/test_template_search")
+                .script(StoredScript.of(s -> s
+                        .source(
+                                "{" +
+                                        "  \"script\": {" +
+                                        "    \"lang\": \"mustache\"," +
+                                        "    \"source\": {" +
+                                        "      \"query\": { \"match\" : { \"{{field}}\" : \"{{value}}\" } }," +
+                                        "      \"size\" : \"{{size}}\"" +
+                                        "    }" +
+                                        "  }" +
+                                        "}"
+                        )
+                ))
+                .build();
+        client.putScript(putScriptRequest);
+
+        Map<String, JsonData> scriptParams = new HashMap<>();
+        scriptParams.put("field", JsonData.of("master_brand_name"));
+        scriptParams.put("value", JsonData.of("一汽"));
+        scriptParams.put("size", JsonData.of(5));
+
+        SearchTemplateResponse<CarSerialBrand> response = client.searchTemplate(SearchTemplateRequest.of(t -> t
+                .index("car")
+                .params(scriptParams)
+                .id("test_template_search")
+        ), CarSerialBrand.class);
+        return null;
     }
 }
